@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import YouTube from "react-youtube";
-import { GoogleGenAI, Type } from "@google/genai";
+import { GoogleGenAI, Modality, Type } from "@google/genai";
 
 const LIVE_MODEL = "gemini-3.1-flash-live-preview";
 
