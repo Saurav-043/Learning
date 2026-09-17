@@ -720,7 +720,7 @@ export default function LearnPage() {
                     },
 
                     config: {
-                        responseModalities: ["AUDIO"],
+                        responseModalities: [Modality.AUDIO],
                         sessionResumption: {},
 
                         tools: [
