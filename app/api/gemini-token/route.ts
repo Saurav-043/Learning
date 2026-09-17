@@ -1,4 +1,5 @@
-import { GoogleGenAI } from "@google/genai";
+
+import { GoogleGenAI, Modality } from "@google/genai";
 
 export const runtime = "nodejs";
 
@@ -32,7 +33,7 @@ export async function GET() {
                     model: LIVE_MODEL,
 
                     config: {
-                        responseModalities: ["AUDIO"],
+                        responseModalities: [Modality.AUDIO],
                         sessionResumption: {},
                     },
                 },
