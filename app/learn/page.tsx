@@ -1,2356 +1,1176 @@
 "use client";
 
-import {
-    useCallback,
-    useEffect,
-    useRef,
-    useState,
-} from "react";
-
+import { useCallback, useEffect, useRef, useState } from "react";
 import YouTube from "react-youtube";
+import { GoogleGenAI, Type } from "@google/genai";
 
-import {
-    GoogleGenAI,
-    Modality,
-} from "@google/genai";
+const LIVE_MODEL = "gemini-3.1-flash-live-preview";
 
-
-// ========================================
-// TYPES
-// ========================================
-
-type Message = {
-    role: "user" | "gemini";
+type ConversationItem = {
+    role: "user" | "assistant";
     text: string;
 };
 
-type WorkletMessage =
-    | {
-        type: "audio";
-        data: Float32Array;
-    }
-    | {
-        type: "speechStart";
-        rms: number;
-    }
-    | {
-        type: "speechEnd";
-        rms: number;
-    };
+type GeminiSession = any;
 
+function getYouTubeVideoId(url: string): string {
+    if (!url) return "";
 
-type TranscriptSegment = {
-    text: string;
-    duration: number;
-    offset: number;
-};
+    const value = url.trim();
 
-
-// ========================================
-// YOUTUBE VIDEO ID
-// ========================================
-
-function getYouTubeVideoId(
-    value: string
-) {
-    const input =
-        value.trim();
-
-    // Already a YouTube ID
-    if (
-        /^[a-zA-Z0-9_-]{11}$/.test(
-            input
-        )
-    ) {
-        return input;
+    if (/^[a-zA-Z0-9_-]{11}$/.test(value)) {
+        return value;
     }
 
     try {
-        const url =
-            new URL(input);
+        const parsed = new URL(value);
+        const hostname = parsed.hostname.toLowerCase();
 
-        // youtu.be/VIDEO_ID
-        if (
-            url.hostname.includes(
-                "youtu.be"
-            )
-        ) {
-            return url.pathname
-                .slice(1)
-                .split("/")[0];
+        if (hostname === "youtu.be" || hostname.endsWith(".youtu.be")) {
+            return parsed.pathname.replace(/^\/+/, "").split("/")[0];
         }
-
-        // youtube.com/watch?v=VIDEO_ID
-        const id =
-            url.searchParams.get(
-                "v"
-            );
-
-        if (id) {
-            return id;
-        }
-
-        // embed / shorts / live
-        const parts =
-            url.pathname
-                .split("/")
-                .filter(Boolean);
-
-        const markerIndex =
-            parts.findIndex(
-                (part) =>
-                    [
-                        "embed",
-                        "shorts",
-                        "live",
-                    ].includes(part)
-            );
 
         if (
-            markerIndex >= 0
+            hostname === "youtube.com" ||
+            hostname === "www.youtube.com" ||
+            hostname.endsWith(".youtube.com")
         ) {
-            return (
-                parts[
-                markerIndex + 1
-                ] || ""
+            const v = parsed.searchParams.get("v");
+            if (v) return v;
+
+            const parts = parsed.pathname.split("/").filter(Boolean);
+            const index = parts.findIndex((part) =>
+                ["embed", "shorts", "live"].includes(part.toLowerCase())
             );
+
+            if (index !== -1 && parts[index + 1]) {
+                return parts[index + 1];
+            }
         }
-
-        return "";
-
     } catch {
         return "";
     }
+
+    return "";
 }
 
-
-// ========================================
-// FLOAT32 -> PCM16 BASE64
-// ========================================
-
-function float32ToPCM16Base64(
-    samples: Float32Array
-) {
-    const buffer =
-        new ArrayBuffer(
-            samples.length * 2
-        );
-
-    const view =
-        new DataView(buffer);
-
-    for (
-        let i = 0;
-        i < samples.length;
-        i++
-    ) {
-        const sample =
-            Math.max(
-                -1,
-                Math.min(
-                    1,
-                    samples[i] * 2.2
-                )
-            );
-
-        view.setInt16(
-            i * 2,
-            sample < 0
-                ? sample * 0x8000
-                : sample * 0x7fff,
-            true
-        );
-    }
-
-    const bytes =
-        new Uint8Array(
-            buffer
-        );
-
+function arrayBufferToBase64(buffer: ArrayBuffer): string {
+    const bytes = new Uint8Array(buffer);
     let binary = "";
+    const chunkSize = 0x8000;
 
-    const chunkSize =
-        0x8000;
-
-    for (
-        let i = 0;
-        i < bytes.length;
-        i += chunkSize
-    ) {
-        binary +=
-            String.fromCharCode(
-                ...bytes.subarray(
-                    i,
-                    i + chunkSize
-                )
-            );
+    for (let i = 0; i < bytes.length; i += chunkSize) {
+        const chunk = bytes.subarray(i, Math.min(i + chunkSize, bytes.length));
+        binary += String.fromCharCode(...chunk);
     }
 
     return btoa(binary);
 }
 
-
-// ========================================
-// BASE64 -> PCM16
-// ========================================
-
-function base64ToInt16(
-    base64: string
-) {
-    const binary =
-        atob(base64);
-
-    const bytes =
-        new Uint8Array(
-            binary.length
-        );
-
-    for (
-        let i = 0;
-        i < binary.length;
-        i++
-    ) {
-        bytes[i] =
-            binary.charCodeAt(i);
-    }
-
-    return new Int16Array(
-        bytes.buffer
-    );
-}
-
-
-// ========================================
-// MAIN PAGE
-// ========================================
+const consultLectureVideoDeclaration = {
+    name: "consultLectureVideo",
+    description:
+        "Look further into the lecture video for something the live frame and current lecture context do not cover — for example something taught earlier or later than the current pause point. Only use this when you cannot answer from the current frame, audio, or lecture context.",
+    parameters: {
+        type: Type.OBJECT,
+        properties: {
+            question: {
+                type: Type.STRING,
+                description: "The specific thing to check, phrased as a clear question.",
+            },
+        },
+        required: ["question"],
+    },
+};
 
 export default function LearnPage() {
+    // ---------------------------------------------------------
+    // VIDEO
+    // ---------------------------------------------------------
 
-    // --------------------------------------
-    // Basic state
-    // --------------------------------------
+    const [videoUrl, setVideoUrl] = useState("");
+    const [pausedAt, setPausedAt] = useState(0);
 
-    const [videoUrl, setVideoUrl] =
-        useState("");
+    const playerRef = useRef<any>(null);
 
-    const [pausedAt, setPausedAt] =
-        useState<number | null>(
-            null
-        );
+    // ---------------------------------------------------------
+    // UI STATE
+    // ---------------------------------------------------------
 
-    const [doubtMode, setDoubtMode] =
-        useState(false);
+    const [doubtMode, setDoubtMode] = useState(false);
+    const [status, setStatus] = useState("Paste a lecture URL to start.");
+    const [lectureContext, setLectureContext] = useState("");
+    const [lectureLoading, setLectureLoading] = useState(false);
+    const [conversation, setConversation] = useState<ConversationItem[]>([]);
+    const [speaking, setSpeaking] = useState(false);
+    const [micLevel, setMicLevel] = useState(0);
 
-    const [status, setStatus] =
-        useState("Ready");
+    // ---------------------------------------------------------
+    // PERSISTENT VIDEO-UNDERSTANDING HANDLE
+    // ---------------------------------------------------------
 
-    const [micLevel, setMicLevel] =
-        useState(0);
+    const interactionIdRef = useRef<string | null>(null);
 
-    const [speaking, setSpeaking] =
-        useState(false);
+    // ---------------------------------------------------------
+    // GEMINI
+    // ---------------------------------------------------------
 
-    const [conversation, setConversation] =
-        useState<Message[]>([]);
+    const sessionRef = useRef<GeminiSession | null>(null);
+    const audioContextRef = useRef<AudioContext | null>(null);
+    const micStreamRef = useRef<MediaStream | null>(null);
+    const micSourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
+    const micWorkletRef = useRef<AudioWorkletNode | null>(null);
+    const analyserRef = useRef<AnalyserNode | null>(null);
 
+    // ---------------------------------------------------------
+    // LIVE VIDEO CAPTURE
+    // ---------------------------------------------------------
 
-    // --------------------------------------
-    // Lecture context
-    // --------------------------------------
+    const screenStreamRef = useRef<MediaStream | null>(null);
+    const screenVideoRef = useRef<HTMLVideoElement | null>(null);
+    const frameCanvasRef = useRef<HTMLCanvasElement | null>(null);
+    const frameIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+    const [videoSharing, setVideoSharing] = useState(false);
 
-    const [
-        lectureContext,
-        setLectureContext,
-    ] = useState("");
+    // ---------------------------------------------------------
+    // AUDIO PLAYBACK (queued, to avoid overlapping chunks)
+    // ---------------------------------------------------------
 
-    const [
-        lectureLoading,
-        setLectureLoading,
-    ] = useState(false);
+    const outputAudioContextRef = useRef<AudioContext | null>(null);
+    const outputQueueTimeRef = useRef(0);
+    const outputSourcesRef = useRef<Set<AudioBufferSourceNode>>(new Set());
 
+    // ---------------------------------------------------------
+    // STOP ANY CURRENTLY QUEUED/PLAYING GEMINI AUDIO
+    // ---------------------------------------------------------
 
-    const [
-        transcript,
-        setTranscript,
-    ] = useState<TranscriptSegment[]>([]);
+    const stopAudioPlayback = useCallback(() => {
+        for (const source of outputSourcesRef.current) {
+            try {
+                source.stop();
+            } catch {
+                // already stopped
+            }
+        }
 
-    const [
-        transcriptLoading,
-        setTranscriptLoading,
-    ] = useState(false);
+        outputSourcesRef.current.clear();
 
+        const ctx = outputAudioContextRef.current;
+        outputQueueTimeRef.current = ctx ? ctx.currentTime : 0;
 
-    // --------------------------------------
-    // YouTube player
-    // --------------------------------------
-
-    const playerRef =
-        useRef<any>(null);
-
-
-    // --------------------------------------
-    // Gemini session
-    // --------------------------------------
-
-    const sessionRef =
-        useRef<any>(null);
-
-
-    // --------------------------------------
-    // Audio refs
-    // --------------------------------------
-
-    const audioContextRef =
-        useRef<AudioContext | null>(
-            null
-        );
-
-    const micStreamRef =
-        useRef<MediaStream | null>(
-            null
-        );
-
-    const sourceRef =
-        useRef<MediaStreamAudioSourceNode | null>(
-            null
-        );
-
-    const gainRef =
-        useRef<GainNode | null>(
-            null
-        );
-
-    const analyserRef =
-        useRef<AnalyserNode | null>(
-            null
-        );
-
-    const workletRef =
-        useRef<AudioWorkletNode | null>(
-            null
-        );
-
-    const monitorGainRef =
-        useRef<GainNode | null>(
-            null
-        );
-
-    const animationRef =
-        useRef<number | null>(
-            null
-        );
-
-
-    // --------------------------------------
-    // Gemini output audio
-    // --------------------------------------
-
-    const outputSourcesRef =
-        useRef<
-            Set<AudioBufferSourceNode>
-        >(new Set());
-
-    const outputQueueTimeRef =
-        useRef(0);
-
-
-    // --------------------------------------
-    // Transcription refs
-    // --------------------------------------
-
-    const currentUserTextRef =
-        useRef("");
-
-    const currentGeminiTextRef =
-        useRef("");
-
-
-    // --------------------------------------
-    // VAD refs
-    // --------------------------------------
-
-    const speechActiveRef =
-        useRef(false);
-
-    const finishingTurnRef =
-        useRef(false);
-
-
-    // ========================================
-    // GET VIDEO URL
-    // ========================================
-
-    useEffect(() => {
-
-        const params =
-            new URLSearchParams(
-                window.location.search
-            );
-
-        setVideoUrl(
-            params.get("video") ||
-            ""
-        );
-
+        setSpeaking(false);
     }, []);
 
+    // ---------------------------------------------------------
+    // CLEANUP: VIDEO SHARING
+    // ---------------------------------------------------------
 
-    // ========================================
-    // LOAD YOUTUBE TRANSCRIPT
-    // ========================================
+    const stopVideoSharing = useCallback(() => {
+        console.log("SCREEN CAPTURE STOPPED");
 
-    const loadTranscript =
-        useCallback(
-            async () => {
+        if (frameIntervalRef.current) {
+            clearInterval(frameIntervalRef.current);
+            frameIntervalRef.current = null;
+        }
 
-                if (!videoUrl) {
-                    return [];
-                }
+        if (screenStreamRef.current) {
+            screenStreamRef.current.getTracks().forEach((track) => track.stop());
+            screenStreamRef.current = null;
+        }
 
-                setTranscriptLoading(true);
-                setStatus("Loading lecture...");
+        if (screenVideoRef.current) {
+            screenVideoRef.current.pause();
+            screenVideoRef.current.srcObject = null;
+            screenVideoRef.current = null;
+        }
 
-                try {
+        frameCanvasRef.current = null;
 
-                    const response =
-                        await fetch(
-                            "/api/youtube-transcript",
-                            {
-                                method: "POST",
-                                headers: {
-                                    "Content-Type":
-                                        "application/json",
-                                },
-                                body: JSON.stringify({
-                                    videoUrl,
-                                }),
-                            }
-                        );
+        setVideoSharing(false);
+    }, []);
 
-                    const data =
-                        await response.json();
+    // ---------------------------------------------------------
+    // SEND LIVE VIDEO FRAME
+    // ---------------------------------------------------------
 
-                    if (!response.ok) {
-                        throw new Error(
-                            data.error ||
-                            "Could not load YouTube transcript"
-                        );
-                    }
+    const sendVideoFrame = useCallback(() => {
+        const session = sessionRef.current;
+        const video = screenVideoRef.current;
+        const canvas = frameCanvasRef.current;
 
-                    const segments =
-                        Array.isArray(data.transcript)
-                            ? data.transcript
-                            : [];
-
-                    setTranscript(segments);
-
-                    return segments as TranscriptSegment[];
-
-                } finally {
-
-                    setTranscriptLoading(false);
-
-                }
-
-            },
-            [videoUrl]
-        );
-
-
-    useEffect(() => {
-
-        if (!videoUrl) {
+        if (!session || !video || !canvas) {
             return;
         }
 
-        setTranscript([]);
-        setLectureContext("");
+        if (video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) {
+            return;
+        }
 
-        void loadTranscript()
-            .then(() => {
-                setStatus("Ready");
-            })
-            .catch((error) => {
-                console.error(
-                    "Transcript load error:",
-                    error
-                );
+        if (video.videoWidth === 0 || video.videoHeight === 0) {
+            return;
+        }
 
-                setStatus(
-                    error instanceof Error
-                        ? error.message
-                        : "Could not load lecture transcript"
-                );
+        const context = canvas.getContext("2d");
+        if (!context) return;
+
+        context.drawImage(video, 0, 0, canvas.width, canvas.height);
+
+        canvas.toBlob(
+            async (blob) => {
+                if (!blob) return;
+
+                try {
+                    const buffer = await blob.arrayBuffer();
+                    const base64 = arrayBufferToBase64(buffer);
+
+                    if (!sessionRef.current) {
+                        return;
+                    }
+
+                    sessionRef.current.sendRealtimeInput({
+                        video: {
+                            data: base64,
+                            mimeType: "image/jpeg",
+                        },
+                    });
+
+                    console.log(
+                        "LIVE FRAME SENT TO GEMINI",
+                        Math.round(blob.size / 1024),
+                        "KB"
+                    );
+                } catch (error) {
+                    console.error("Error sending video frame:", error);
+                }
+            },
+            "image/jpeg",
+            0.65
+        );
+    }, []);
+
+    // ---------------------------------------------------------
+    // START VIDEO SHARING
+    // ---------------------------------------------------------
+
+    const startVideoSharing = useCallback(async () => {
+        try {
+            if (!sessionRef.current) {
+                setStatus("Connect Gemini first, then share the lecture.");
+                console.error("Cannot share video: Gemini session does not exist.");
+                return;
+            }
+
+            if (!navigator.mediaDevices?.getDisplayMedia) {
+                setStatus("This browser does not support screen sharing.");
+                return;
+            }
+
+            if (screenStreamRef.current) {
+                return;
+            }
+
+            const stream = await navigator.mediaDevices.getDisplayMedia({
+                video: { frameRate: 1 },
+                audio: false,
             });
 
-    }, [videoUrl, loadTranscript]);
+            screenStreamRef.current = stream;
 
+            const video = document.createElement("video");
+            video.autoplay = true;
+            video.muted = true;
+            video.playsInline = true;
+            video.srcObject = stream;
 
-    // ========================================
-    // STOP GEMINI AUDIO
-    // ========================================
+            screenVideoRef.current = video;
 
-    const stopAudioPlayback =
-        useCallback(() => {
+            await video.play();
 
-            for (
-                const source of
-                outputSourcesRef.current
-            ) {
-                try {
-                    source.stop();
-                } catch { }
-            }
-
-            outputSourcesRef.current.clear();
-
-            const ctx =
-                audioContextRef.current;
-
-            outputQueueTimeRef.current =
-                ctx
-                    ? ctx.currentTime
-                    : 0;
-
-        }, []);
-
-
-    // ========================================
-    // PLAY GEMINI AUDIO
-    // ========================================
-
-    const playGeminiAudio =
-        useCallback(
-            (
-                base64: string
-            ) => {
-
-                const ctx =
-                    audioContextRef.current;
-
-                if (!ctx) {
+            await new Promise<void>((resolve) => {
+                if (video.videoWidth > 0 && video.videoHeight > 0) {
+                    resolve();
                     return;
                 }
-
-                const pcm =
-                    base64ToInt16(
-                        base64
-                    );
-
-                if (
-                    !pcm.length
-                ) {
-                    return;
-                }
-
-                const buffer =
-                    ctx.createBuffer(
-                        1,
-                        pcm.length,
-                        24000
-                    );
-
-                const channel =
-                    buffer.getChannelData(
-                        0
-                    );
-
-                for (
-                    let i = 0;
-                    i < pcm.length;
-                    i++
-                ) {
-                    channel[i] =
-                        pcm[i] / 32768;
-                }
-
-                const source =
-                    ctx.createBufferSource();
-
-                source.buffer =
-                    buffer;
-
-                source.connect(
-                    ctx.destination
-                );
-
-                const startAt =
-                    Math.max(
-                        ctx.currentTime +
-                        0.06,
-                        outputQueueTimeRef.current
-                    );
-
-                source.start(
-                    startAt
-                );
-
-                outputQueueTimeRef.current =
-                    startAt +
-                    buffer.duration;
-
-                outputSourcesRef.current.add(
-                    source
-                );
-
-                source.onended =
-                    () => {
-
-                        outputSourcesRef.current.delete(
-                            source
-                        );
-
-                    };
-
-            },
-            []
-        );
-
-
-    // ========================================
-    // STOP MICROPHONE
-    // ========================================
-
-    const stopMicrophone =
-        useCallback(() => {
-
-            if (
-                animationRef.current !==
-                null
-            ) {
-
-                cancelAnimationFrame(
-                    animationRef.current
-                );
-
-                animationRef.current =
-                    null;
-
-            }
-
-
-            try {
-                sourceRef.current?.disconnect();
-            } catch { }
-
-            try {
-                gainRef.current?.disconnect();
-            } catch { }
-
-            try {
-                analyserRef.current?.disconnect();
-            } catch { }
-
-            try {
-                workletRef.current?.disconnect();
-            } catch { }
-
-            try {
-                monitorGainRef.current?.disconnect();
-            } catch { }
-
-
-            micStreamRef.current
-                ?.getTracks()
-                .forEach(
-                    (track) =>
-                        track.stop()
-                );
-
-
-            micStreamRef.current =
-                null;
-
-
-            const ctx =
-                audioContextRef.current;
-
-            audioContextRef.current =
-                null;
-
-
-            if (
-                ctx &&
-                ctx.state !==
-                "closed"
-            ) {
-
-                void ctx.close();
-
-            }
-
-
-            sourceRef.current =
-                null;
-
-            gainRef.current =
-                null;
-
-            analyserRef.current =
-                null;
-
-            workletRef.current =
-                null;
-
-            monitorGainRef.current =
-                null;
-
-
-            speechActiveRef.current =
-                false;
-
-            finishingTurnRef.current =
-                false;
-
-
-            setSpeaking(false);
-
-            setMicLevel(0);
-
-        }, []);
-
-
-    // ========================================
-    // CLOSE GEMINI SESSION
-    // ========================================
-
-    const closeGeminiSession =
-        useCallback(() => {
-
-            try {
-                sessionRef.current?.close?.();
-            } catch { }
-
-            sessionRef.current =
-                null;
-
-        }, []);
-
-
-    // ========================================
-    // SAVE CONVERSATION
-    // ========================================
-
-    const addFinishedConversation =
-        useCallback(() => {
-
-            const userText =
-                currentUserTextRef.current
-                    .trim();
-
-            const geminiText =
-                currentGeminiTextRef.current
-                    .trim();
-
-
-            if (userText) {
-
-                setConversation(
-                    (prev) => [
-                        ...prev,
-
-                        {
-                            role: "user",
-                            text: userText,
-                        },
-
-                    ]
-                );
-
-            }
-
-
-            if (geminiText) {
-
-                setConversation(
-                    (prev) => [
-                        ...prev,
-
-                        {
-                            role: "gemini",
-                            text:
-                                geminiText,
-                        },
-
-                    ]
-                );
-
-            }
-
-
-            currentUserTextRef.current =
-                "";
-
-            currentGeminiTextRef.current =
-                "";
-
-        }, []);
-
-
-    // ========================================
-    // FINISH SPEECH TURN
-    // ========================================
-
-    const finishTurn =
-        useCallback(() => {
-
-            const session =
-                sessionRef.current;
-
-            if (
-                !session ||
-                finishingTurnRef.current
-            ) {
+                video.onloadedmetadata = () => resolve();
+            });
+
+            const width = Math.min(video.videoWidth || 1280, 1280);
+            const height = Math.max(
+                1,
+                Math.round(
+                    ((video.videoHeight || 720) / (video.videoWidth || 1280)) * width
+                )
+            );
+
+            const canvas = document.createElement("canvas");
+            canvas.width = width;
+            canvas.height = height;
+
+            frameCanvasRef.current = canvas;
+
+            setVideoSharing(true);
+            setStatus("Gemini is now receiving live lecture frames.");
+
+            console.log("SCREEN CAPTURE STARTED", video.videoWidth, "x", video.videoHeight);
+
+            sendVideoFrame();
+
+            frameIntervalRef.current = setInterval(() => {
+                sendVideoFrame();
+            }, 1000);
+
+            const track = stream.getVideoTracks()[0];
+
+            track.onended = () => {
+                stopVideoSharing();
+                setStatus("Video sharing stopped.");
+            };
+        } catch (error) {
+            console.error("Could not start video sharing:", error);
+            setVideoSharing(false);
+            setStatus("Video sharing was cancelled or denied.");
+        }
+    }, [sendVideoFrame, stopVideoSharing]);
+
+    // ---------------------------------------------------------
+    // MICROPHONE
+    // ---------------------------------------------------------
+
+    const startMicrophone = useCallback(async () => {
+        try {
+            if (!navigator.mediaDevices?.getUserMedia) {
+                setStatus("This browser does not support microphone access.");
                 return;
             }
 
+            if (!window.AudioWorkletNode) {
+                setStatus("This browser does not support AudioWorklet.");
+                return;
+            }
 
-            finishingTurnRef.current =
-                true;
+            const stream = await navigator.mediaDevices.getUserMedia({
+                audio: {
+                    channelCount: 1,
+                    echoCancellation: true,
+                    noiseSuppression: true,
+                    autoGainControl: true,
+                },
+            });
 
-            speechActiveRef.current =
-                false;
+            micStreamRef.current = stream;
 
-            setSpeaking(false);
+            const audioContext = new AudioContext({ sampleRate: 16000 });
+            audioContextRef.current = audioContext;
+
+            if (audioContext.state === "suspended") {
+                await audioContext.resume();
+            }
+
+            await audioContext.audioWorklet.addModule("/pcm-worklet.js");
+
+            const source = audioContext.createMediaStreamSource(stream);
+            micSourceRef.current = source;
+
+            const analyser = audioContext.createAnalyser();
+            analyser.fftSize = 256;
+            analyser.smoothingTimeConstant = 0.8;
+            analyserRef.current = analyser;
+
+            source.connect(analyser);
+
+            const worklet = new AudioWorkletNode(audioContext, "pcm-processor");
+            micWorkletRef.current = worklet;
+
+            worklet.port.onmessage = (event) => {
+                const pcm = event.data;
+
+                if (!pcm || !sessionRef.current) return;
+                if (!(pcm instanceof ArrayBuffer)) return;
+
+                const base64 = arrayBufferToBase64(pcm);
+
+                sessionRef.current.sendRealtimeInput({
+                    audio: {
+                        data: base64,
+                        mimeType: "audio/pcm;rate=16000",
+                    },
+                });
+            };
+
+            source.connect(worklet);
 
             setStatus(
-                "Thinking..."
+                videoSharing
+                    ? "Listening + watching lecture"
+                    : "Listening"
             );
 
+            console.log("MICROPHONE STARTED");
+
+            const updateLevel = () => {
+                if (!analyserRef.current) return;
+
+                const analyser = analyserRef.current;
+                const data = new Uint8Array(analyser.frequencyBinCount);
+                analyser.getByteTimeDomainData(data);
+
+                let sum = 0;
+                for (const value of data) {
+                    const normalized = (value - 128) / 128;
+                    sum += normalized * normalized;
+                }
+
+                const rms = Math.sqrt(sum / data.length);
+                setMicLevel(Math.min(1, rms * 4));
+
+                requestAnimationFrame(updateLevel);
+            };
+
+            updateLevel();
+        } catch (error) {
+            console.error("Microphone error:", error);
+            setStatus("Microphone permission denied or failed.");
+        }
+    }, [videoSharing]);
+
+    const stopMicrophone = useCallback(() => {
+        if (micWorkletRef.current) {
+            micWorkletRef.current.port.onmessage = null;
+            micWorkletRef.current.disconnect();
+            micWorkletRef.current = null;
+        }
+
+        if (micSourceRef.current) {
+            micSourceRef.current.disconnect();
+            micSourceRef.current = null;
+        }
+
+        if (micStreamRef.current) {
+            micStreamRef.current.getTracks().forEach((track) => track.stop());
+            micStreamRef.current = null;
+        }
+
+        if (audioContextRef.current) {
+            audioContextRef.current.close();
+            audioContextRef.current = null;
+        }
+
+        analyserRef.current = null;
+        setMicLevel(0);
+    }, []);
+
+    // ---------------------------------------------------------
+    // PLAY GEMINI AUDIO (queued sequentially — fixes double voice)
+    // ---------------------------------------------------------
+
+    const playAudioBytes = useCallback(async (bytes: Uint8Array) => {
+        try {
+            if (!outputAudioContextRef.current) {
+                outputAudioContextRef.current = new AudioContext({ sampleRate: 24000 });
+            }
+
+            const ctx = outputAudioContextRef.current;
+
+            if (ctx.state === "suspended") {
+                await ctx.resume();
+            }
+
+            const samples = new Int16Array(
+                bytes.buffer,
+                bytes.byteOffset,
+                Math.floor(bytes.byteLength / 2)
+            );
+
+            if (samples.length === 0) {
+                return;
+            }
+
+            const buffer = ctx.createBuffer(1, samples.length, 24000);
+            const channel = buffer.getChannelData(0);
+
+            for (let i = 0; i < samples.length; i++) {
+                channel[i] = samples[i] / 32768;
+            }
+
+            const source = ctx.createBufferSource();
+            source.buffer = buffer;
+            source.connect(ctx.destination);
+
+            // Schedule this chunk to start exactly when the
+            // previous chunk finishes, instead of immediately —
+            // this is what stops chunks overlapping into a
+            // "double voice" effect.
+            const startAt = Math.max(
+                ctx.currentTime + 0.02,
+                outputQueueTimeRef.current
+            );
+
+            source.start(startAt);
+
+            outputQueueTimeRef.current = startAt + buffer.duration;
+
+            outputSourcesRef.current.add(source);
+
+            setSpeaking(true);
+
+            source.onended = () => {
+                outputSourcesRef.current.delete(source);
+
+                if (outputSourcesRef.current.size === 0) {
+                    setSpeaking(false);
+                }
+            };
+        } catch (error) {
+            console.error("Audio playback error:", error);
+        }
+    }, []);
+
+    // ---------------------------------------------------------
+    // TOOL CALL: consultLectureVideo
+    // ---------------------------------------------------------
+
+    const handleToolCall = useCallback(async (toolCall: any) => {
+        const session = sessionRef.current;
+        if (!session) return;
+
+        const functionResponses: any[] = [];
+
+        for (const functionCall of toolCall?.functionCalls || []) {
+            if (functionCall.name !== "consultLectureVideo") {
+                functionResponses.push({
+                    name: functionCall.name,
+                    id: functionCall.id,
+                    response: { error: "Unknown tool." },
+                });
+                continue;
+            }
+
+            const question =
+                typeof functionCall.args?.question === "string"
+                    ? functionCall.args.question
+                    : "";
+
+            const currentInteractionId = interactionIdRef.current;
+
+            if (!question || !currentInteractionId) {
+                functionResponses.push({
+                    name: functionCall.name,
+                    id: functionCall.id,
+                    response: { error: "No lecture video context is available right now." },
+                });
+                continue;
+            }
 
             try {
-
-                session.sendRealtimeInput({
-                    audioStreamEnd: true,
+                const response = await fetch("/api/lecture-question", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ interactionId: currentInteractionId, question }),
                 });
 
+                const data = await response.json();
+
+                if (!response.ok || !data.answer) {
+                    functionResponses.push({
+                        name: functionCall.name,
+                        id: functionCall.id,
+                        response: { error: data.error || "Could not consult the lecture video." },
+                    });
+                    continue;
+                }
+
+                if (typeof data.interactionId === "string") {
+                    interactionIdRef.current = data.interactionId;
+                }
+
+                functionResponses.push({
+                    name: functionCall.name,
+                    id: functionCall.id,
+                    response: { answer: data.answer },
+                });
             } catch (error) {
-
-                console.error(
-                    "audioStreamEnd error:",
-                    error
-                );
-
-                finishingTurnRef.current =
-                    false;
-
+                console.error("consultLectureVideo error:", error);
+                functionResponses.push({
+                    name: functionCall.name,
+                    id: functionCall.id,
+                    response: { error: "Could not reach the lecture video service." },
+                });
             }
+        }
 
-        }, []);
+        try {
+            session.sendToolResponse({ functionResponses });
+        } catch (error) {
+            console.error("sendToolResponse error:", error);
+        }
+    }, []);
 
+    // ---------------------------------------------------------
+    // GEMINI MESSAGE
+    // ---------------------------------------------------------
 
-    // ========================================
-    // START MICROPHONE
-    // ========================================
-
-    const startMicrophone =
-        useCallback(
-            async () => {
-
-                if (
-                    !sessionRef.current
-                ) {
-                    return;
+    const handleGeminiMessage = useCallback(
+        async (message: any) => {
+            try {
+                if (message?.toolCall) {
+                    void handleToolCall(message.toolCall);
                 }
 
+                const serverContent = message?.serverContent;
 
-                const stream =
-                    await navigator
-                        .mediaDevices
-                        .getUserMedia({
-                            audio: {
-                                channelCount: 1,
-                                echoCancellation: true,
-                                noiseSuppression: true,
-                                autoGainControl: true,
-                            },
-                        });
-
-
-                micStreamRef.current =
-                    stream;
-
-
-                const ctx =
-                    new AudioContext();
-
-                audioContextRef.current =
-                    ctx;
-
-
-                if (
-                    ctx.state ===
-                    "suspended"
-                ) {
-
-                    await ctx.resume();
-
+                // Gemini sends this when the student starts talking
+                // while it's still speaking (barge-in). Stop whatever
+                // is queued/playing immediately, or the old response
+                // keeps sounding underneath the new one.
+                if (serverContent?.interrupted) {
+                    stopAudioPlayback();
                 }
 
+                const modelTurn = serverContent?.modelTurn;
+                const parts = modelTurn?.parts || [];
 
-                await ctx.audioWorklet
-                    .addModule(
-                        "/pcm-worklet.js"
-                    );
+                for (const part of parts) {
+                    if (part?.inlineData?.data) {
+                        const mimeType = part.inlineData.mimeType || "";
 
+                        if (mimeType.startsWith("audio/")) {
+                            const binary = atob(part.inlineData.data);
+                            const bytes = new Uint8Array(binary.length);
 
-                const source =
-                    ctx.createMediaStreamSource(
-                        stream
-                    );
-
-                const gain =
-                    ctx.createGain();
-
-                const analyser =
-                    ctx.createAnalyser();
-
-                const worklet =
-                    new AudioWorkletNode(
-                        ctx,
-                        "pcm-processor"
-                    );
-
-                const monitorGain =
-                    ctx.createGain();
-
-
-                gain.gain.value =
-                    1;
-
-                analyser.fftSize =
-                    1024;
-
-                monitorGain.gain.value =
-                    0;
-
-
-                source.connect(
-                    gain
-                );
-
-                gain.connect(
-                    analyser
-                );
-
-                gain.connect(
-                    worklet
-                );
-
-                worklet.connect(
-                    monitorGain
-                );
-
-                monitorGain.connect(
-                    ctx.destination
-                );
-
-
-                sourceRef.current =
-                    source;
-
-                gainRef.current =
-                    gain;
-
-                analyserRef.current =
-                    analyser;
-
-                workletRef.current =
-                    worklet;
-
-                monitorGainRef.current =
-                    monitorGain;
-
-
-                // --------------------------------
-                // WORKLET MESSAGES
-                // --------------------------------
-
-                worklet.port.onmessage =
-                    (
-                        event: MessageEvent<WorkletMessage>
-                    ) => {
-
-                        const message =
-                            event.data;
-
-                        const session =
-                            sessionRef.current;
-
-
-                        // Speech started
-                        if (
-                            message.type ===
-                            "speechStart"
-                        ) {
-
-                            if (
-                                !speechActiveRef.current
-                            ) {
-
-                                speechActiveRef.current =
-                                    true;
-
-                                finishingTurnRef.current =
-                                    false;
-
-                                setSpeaking(true);
-
-                                setStatus(
-                                    "Listening..."
-                                );
-
+                            for (let i = 0; i < binary.length; i++) {
+                                bytes[i] = binary.charCodeAt(i);
                             }
 
-                            return;
+                            await playAudioBytes(bytes);
                         }
-
-
-                        // Speech ended
-                        if (
-                            message.type ===
-                            "speechEnd"
-                        ) {
-
-                            if (
-                                speechActiveRef.current
-                            ) {
-
-                                finishTurn();
-
-                            }
-
-                            return;
-                        }
-
-
-                        // Audio
-                        if (
-                            message.type !==
-                            "audio" ||
-                            !session
-                        ) {
-                            return;
-                        }
-
-
-                        try {
-
-                            const base64 =
-                                float32ToPCM16Base64(
-                                    message.data
-                                );
-
-
-                            session.sendRealtimeInput({
-                                audio: {
-                                    data:
-                                        base64,
-
-                                    mimeType:
-                                        "audio/pcm;rate=16000",
-                                },
-                            });
-
-                        } catch (error) {
-
-                            console.error(
-                                "Audio send error:",
-                                error
-                            );
-
-                        }
-
-                    };
-
-
-                // --------------------------------
-                // MICROPHONE LEVEL
-                // --------------------------------
-
-                const updateLevel =
-                    () => {
-
-                        const analyser =
-                            analyserRef.current;
-
-                        if (!analyser) {
-                            return;
-                        }
-
-
-                        const data =
-                            new Uint8Array(
-                                analyser.fftSize
-                            );
-
-
-                        analyser
-                            .getByteTimeDomainData(
-                                data
-                            );
-
-
-                        let sum = 0;
-
-
-                        for (
-                            const value of data
-                        ) {
-
-                            const normalized =
-                                (value - 128) /
-                                128;
-
-                            sum +=
-                                normalized *
-                                normalized;
-
-                        }
-
-
-                        const rms =
-                            Math.sqrt(
-                                sum /
-                                data.length
-                            );
-
-
-                        setMicLevel(
-                            Math.min(
-                                100,
-                                Math.round(
-                                    rms * 1000
-                                )
-                            )
-                        );
-
-
-                        animationRef.current =
-                            requestAnimationFrame(
-                                updateLevel
-                            );
-
-                    };
-
-
-                updateLevel();
-
-            },
-            [finishTurn]
-        );
-
-
-    // ========================================
-    // CREATE GEMINI LIVE SESSION
-    // ========================================
-
-    const createGeminiSession =
-        useCallback(
-            async (
-                context: string
-            ) => {
-
-                // ----------------------------------
-                // Get ephemeral token
-                // ----------------------------------
-
-                const response =
-                    await fetch(
-                        "/api/gemini-token"
-                    );
-
-
-                const data =
-                    await response.json();
-
-
-                if (
-                    !response.ok ||
-                    !data.token
-                ) {
-
-                    throw new Error(
-                        data.error ||
-                        "Could not get Gemini token"
-                    );
-
+                    }
                 }
 
-
-                // ----------------------------------
-                // Gemini client
-                // ----------------------------------
-
-                const ai =
-                    new GoogleGenAI({
-                        apiKey:
-                            data.token,
-                    });
-
-
-                // ----------------------------------
-                // Live session
-                // ----------------------------------
-
-                const session =
-                    await ai.live.connect({
-
-                        model:
-                            "gemini-3.1-flash-live-preview",
-
-
-                        config: {
-
-                            responseModalities: [
-                                Modality.AUDIO,
-                            ],
-
-
-                            inputAudioTranscription:
-                                {},
-
-                            outputAudioTranscription:
-                                {},
-
-
-                            // --------------------------------
-                            // Hybrid VAD
-                            // --------------------------------
-
-                            realtimeInputConfig: {
-
-                                automaticActivityDetection:
-                                {
-
-                                    disabled:
-                                        true,
-
-                                    prefixPaddingMs:
-                                        300,
-
-                                    silenceDurationMs:
-                                        1500,
-
-                                },
-
-                            },
-
-
-                            // --------------------------------
-                            // AI TUTOR INSTRUCTIONS
-                            // --------------------------------
-
-                            systemInstruction: {
-
-                                parts: [
-
-                                    {
-
-                                        text: `
-
-You are the AI Tutor inside
-"Ready to Learn".
-
-You are helping a student understand
-a video lecture.
-
-========================================
-PRIMARY CONTEXT
-========================================
-
-The student is currently learning from
-the relevant lecture transcript provided below.
-
-Use the lecture context as your PRIMARY
-context.
-
-However, you are NOT restricted to the
-lecture.
-
-You can and SHOULD use your own general
-knowledge whenever it helps the student
-understand something better.
-
-========================================
-YOUR TEACHING GOAL
-========================================
-
-Your goal is NOT simply to answer the
-student's question.
-
-Your goal is to make the student
-UNDERSTAND the concept.
-
-If the student's question is unclear,
-interpret it in the context of the
-lecture.
-
-If the student does not understand your
-first explanation, DO NOT simply repeat
-the same explanation.
-
-Change your teaching strategy.
-
-For example:
-
-First:
-Give a simple explanation.
-
-If they still don't understand:
-Use an analogy.
-
-If necessary:
-Give a tiny concrete example.
-
-If necessary:
-Explain the prerequisite concept.
-
-Then:
-Connect everything back to the lecture.
-
-========================================
-USE YOUR OWN KNOWLEDGE
-========================================
-
-You are allowed to use your own knowledge
-to:
-
-- clarify difficult concepts
-- simplify explanations
-- provide examples
-- create analogies
-- explain prerequisites
-- correct misconceptions
-- add missing information
-- connect related concepts
-- explain things the lecturer skipped
-- correct technically incorrect statements
-
-Do not blindly repeat the lecturer.
-
-If the lecturer is incorrect or
-incomplete, politely correct or clarify
-the information.
-
-========================================
-CONVERSATION
-========================================
-
-Remember the conversation within the
-current doubt session.
-
-If the student asks a follow-up question,
-connect it to what they previously asked.
-
-Do not treat every question as a
-completely new question.
-
-========================================
-SPEAKING STYLE
-========================================
-
-You are speaking to the student.
-
-Be natural.
-
-Avoid unnecessarily long answers.
-
-Use simple language when possible.
-
-When technical detail is required,
-explain it clearly.
-
-Do not sound like a textbook.
-
-Teach like a patient expert tutor.
-
-========================================
-LECTURE CONTEXT
-========================================
-
-${context}
-
-========================================
-END LECTURE TRANSCRIPT CONTEXT
-========================================
-
+                let text = "";
+                for (const part of parts) {
+                    if (typeof part?.text === "string") {
+                        text += part.text;
+                    }
+                }
+
+                if (text.trim()) {
+                    setConversation((previous) => [
+                        ...previous,
+                        { role: "assistant", text: text.trim() },
+                    ]);
+                }
+
+                if (serverContent?.turnComplete) {
+                    // Don't force-stop speaking here — audio chunks
+                    // already queued still need to finish playing.
+                    // `speaking` is cleared by the last chunk's onended.
+                }
+            } catch (error) {
+                console.error("Gemini message handling error:", error);
+            }
+        },
+        [handleToolCall, playAudioBytes, stopAudioPlayback]
+    );
+
+    // ---------------------------------------------------------
+    // CREATE GEMINI SESSION
+    // ---------------------------------------------------------
+
+    const createGeminiSession = useCallback(
+        async (context: string) => {
+            try {
+                setStatus("Connecting to Gemini Live...");
+
+                const tokenResponse = await fetch("/api/gemini-token");
+
+                if (!tokenResponse.ok) {
+                    throw new Error(`Token request failed: ${tokenResponse.status}`);
+                }
+
+                const tokenData = await tokenResponse.json();
+                const token = tokenData?.token;
+
+                if (!token) {
+                    console.error("Token response:", tokenData);
+                    throw new Error("Gemini token was not returned.");
+                }
+
+                const ai = new GoogleGenAI({ apiKey: token });
+
+                const session = await ai.live.connect({
+                    model: LIVE_MODEL,
+
+                    callbacks: {
+                        onopen: () => {
+                            console.log("GEMINI LIVE CONNECTED");
+                            setStatus("Gemini Live connected.");
+                        },
+
+                        onmessage: handleGeminiMessage,
+
+                        onerror: (error: any) => {
+                            console.error("GEMINI LIVE ERROR", error);
+                            setStatus("Gemini Live error. Check console.");
+                        },
+
+                        onclose: (event: any) => {
+                            console.log("Gemini Live closed:", event);
+                            setSpeaking(false);
+                        },
+                    },
+
+                    config: {
+                        responseModalities: ["AUDIO"],
+                        sessionResumption: {},
+
+                        tools: [
+                            { functionDeclarations: [consultLectureVideoDeclaration] },
+                        ],
+
+                        systemInstruction: `
+You are an AI Tutor helping a student watching an educational lecture.
+
+You may receive:
+1. The student's microphone audio.
+2. Live visual frames captured from the lecture screen, roughly once per second.
+3. Written lecture context, generated earlier by analyzing the actual lecture video around the point where the student paused.
+4. A tool called consultLectureVideo, which lets you check a part of the lecture video that is not visible in the current frame (for example something taught earlier or later than the current pause point).
+
+When a live visual frame is available, inspect it carefully. It may contain slides, equations, diagrams, code, definitions, examples, or teacher annotations. Use the most recent frame to understand what the student is currently looking at.
+
+Never claim to see something that is not actually present in the frame you received. Never invent lecture content.
+
+Use consultLectureVideo only when the current frame and the lecture context below do not already answer the question — for example if the student asks about something earlier in the lecture than what is currently on screen.
+
+Lecture context from the paused moment:
+
+${context || "No additional lecture context is available."}
+
+Answer naturally, like a patient teacher. Keep answers clear and reasonably concise.
 `,
-
-                                    },
-
-                                ],
-
-                            },
-
-                        },
-
-
-                        // ==================================
-                        // CALLBACKS
-                        // ==================================
-
-                        callbacks: {
-
-                            onopen: () => {
-
-                                setStatus(
-                                    "Listening..."
-                                );
-
-                            },
-
-
-                            onmessage: (
-                                message: any
-                            ) => {
-
-                                const content =
-                                    message?.serverContent;
-
-                                if (!content) {
-                                    return;
-                                }
-
-
-                                // --------------------------------
-                                // Gemini interrupted
-                                // --------------------------------
-
-                                if (
-                                    content.interrupted
-                                ) {
-
-                                    stopAudioPlayback();
-
-                                }
-
-
-                                // --------------------------------
-                                // User transcript
-                                // --------------------------------
-
-                                if (
-                                    content
-                                        .inputTranscription
-                                        ?.text
-                                ) {
-
-                                    currentUserTextRef.current +=
-                                        content
-                                            .inputTranscription
-                                            .text;
-
-                                }
-
-
-                                // --------------------------------
-                                // Gemini transcript
-                                // --------------------------------
-
-                                if (
-                                    content
-                                        .outputTranscription
-                                        ?.text
-                                ) {
-
-                                    currentGeminiTextRef.current +=
-                                        content
-                                            .outputTranscription
-                                            .text;
-
-                                }
-
-
-                                // --------------------------------
-                                // Gemini audio
-                                // --------------------------------
-
-                                const parts =
-                                    content
-                                        .modelTurn
-                                        ?.parts || [];
-
-
-                                for (
-                                    const part of parts
-                                ) {
-
-                                    if (
-                                        part
-                                            .inlineData
-                                            ?.data
-                                    ) {
-
-                                        playGeminiAudio(
-                                            part
-                                                .inlineData
-                                                .data
-                                        );
-
-                                    }
-
-                                }
-
-
-                                // --------------------------------
-                                // Turn complete
-                                // --------------------------------
-
-                                if (
-                                    content.turnComplete
-                                ) {
-
-                                    finishingTurnRef.current =
-                                        false;
-
-                                    speechActiveRef.current =
-                                        false;
-
-                                    setSpeaking(
-                                        false
-                                    );
-
-                                    setStatus(
-                                        "Listening..."
-                                    );
-
-                                    addFinishedConversation();
-
-                                }
-
-                            },
-
-
-                            onerror: (
-                                error: any
-                            ) => {
-
-                                console.error(
-                                    "Gemini Live error:",
-                                    error
-                                );
-
-                                setStatus(
-                                    "Gemini connection error"
-                                );
-
-                            },
-
-
-                            onclose: (
-                                event: any
-                            ) => {
-
-                                console.log(
-                                    "Gemini Live closed:",
-                                    event?.reason ||
-                                    "closed"
-                                );
-
-                            },
-
-                        },
-
-                    });
-
-
-                sessionRef.current =
-                    session;
-
-            },
-            [
-                addFinishedConversation,
-                playGeminiAudio,
-                stopAudioPlayback,
-            ]
-        );
-
-
-    // ========================================
-    // PREPARE LECTURE CONTEXT
-    // ========================================
-
-    const analyzeLecture =
-        useCallback(
-            async (
-                timestamp: number
-            ) => {
-
+                    },
+                });
+
+                sessionRef.current = session;
+            } catch (error) {
+                console.error("Gemini session creation failed:", error);
+                setStatus("Could not connect to Gemini Live.");
+                throw error;
+            }
+        },
+        [handleGeminiMessage]
+    );
+
+    // ---------------------------------------------------------
+    // GET LECTURE CONTEXT
+    // ---------------------------------------------------------
+
+    const analyzeLecture = useCallback(
+        async (timestamp: number) => {
+            try {
                 setLectureLoading(true);
+                setStatus("Analyzing the lecture...");
 
-                setStatus("Preparing lecture context...");
+                const response = await fetch("/api/lecture-context", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ videoUrl, timestamp }),
+                });
 
-                try {
+                const data = await response.json();
 
-                    // 2 minutes before the pause
-                    // 30 seconds after the pause
-                    const startTime =
-                        Math.max(0, timestamp - 120);
-
-                    const endTime =
-                        timestamp + 30;
-
-                    let availableTranscript =
-                        transcript;
-
-                    // If the initial transcript request
-                    // has not finished yet, load it now.
-                    if (!availableTranscript.length) {
-                        availableTranscript =
-                            await loadTranscript();
-                    }
-
-                    if (!availableTranscript.length) {
-                        throw new Error(
-                            "No YouTube transcript is available for this lecture."
-                        );
-                    }
-
-                    const relevantSegments =
-                        availableTranscript.filter(
-                            (segment) => {
-
-                                const segmentStart =
-                                    segment.offset;
-
-                                const segmentEnd =
-                                    segment.offset +
-                                    segment.duration;
-
-                                return (
-                                    segmentEnd >= startTime &&
-                                    segmentStart <= endTime
-                                );
-
-                            }
-                        );
-
-                    if (!relevantSegments.length) {
-                        throw new Error(
-                            "No transcript was found around the current timestamp."
-                        );
-                    }
-
-                    // Do not send timestamp spam to Gemini.
-                    const context =
-                        relevantSegments
-                            .map(
-                                (segment) =>
-                                    segment.text
-                            )
-                            .join(" ");
-
-                    setLectureContext(context);
-
-                    return context;
-
-                } finally {
-
-                    setLectureLoading(false);
-
+                if (!response.ok) {
+                    throw new Error(data?.error || "Lecture analysis failed.");
                 }
 
-            },
-            [loadTranscript, transcript]
-        );
+                const context = data?.context || "";
 
+                interactionIdRef.current =
+                    typeof data.interactionId === "string" ? data.interactionId : null;
 
-    // ========================================
-    // ASK A DOUBT
-    // ========================================
+                setLectureContext(context);
 
-    const askDoubt =
-        useCallback(
-            async () => {
-
-                if (
-                    !playerRef.current
-                ) {
-                    return;
-                }
-
-
-                // Reset current conversation
-                currentUserTextRef.current =
-                    "";
-
-                currentGeminiTextRef.current =
-                    "";
-
-
-                setConversation([]);
-
+                return context;
+            } catch (error) {
+                console.error("Lecture context error:", error);
                 setLectureContext("");
-
-
-                try {
-
-                    // --------------------------------
-                    // Get exact current time
-                    // --------------------------------
-
-                    const currentTime =
-                        playerRef.current
-                            .getCurrentTime();
-
-
-                    const exactTime =
-                        Math.floor(
-                            currentTime
-                        );
-
-
-                    // --------------------------------
-                    // PAUSE VIDEO IMMEDIATELY
-                    // --------------------------------
-
-                    playerRef.current
-                        .pauseVideo();
-
-
-                    setPausedAt(
-                        exactTime
-                    );
-
-
-                    setDoubtMode(
-                        true
-                    );
-
-
-                    // --------------------------------
-                    // PREPARE 2 MIN BACK + 30 SEC FORWARD
-                    // --------------------------------
-
-                    const context =
-                        await analyzeLecture(
-                            exactTime
-                        );
-
-
-                    // --------------------------------
-                    // START AI TUTOR
-                    // --------------------------------
-
-                    setStatus(
-                        "Starting AI tutor..."
-                    );
-
-
-                    await createGeminiSession(
-                        context
-                    );
-
-
-                    // --------------------------------
-                    // START MICROPHONE
-                    // --------------------------------
-
-                    await startMicrophone();
-
-
-                    setStatus(
-                        "Listening..."
-                    );
-
-                } catch (error) {
-
-                    console.error(
-                        "Ask doubt error:",
-                        error
-                    );
-
-
-                    setStatus(
-                        error instanceof Error
-                            ? error.message
-                            : "Could not start AI tutor"
-                    );
-
-
-                    stopMicrophone();
-
-                    closeGeminiSession();
-
-                    setDoubtMode(
-                        false
-                    );
-
-                }
-
-            },
-            [
-                analyzeLecture,
-                closeGeminiSession,
-                createGeminiSession,
-                startMicrophone,
-                stopMicrophone,
-            ]
-        );
-
-
-    // ========================================
-    // CONTINUE LECTURE
-    // ========================================
-
-    const continueLecture =
-        useCallback(() => {
-
-            // Stop Gemini audio
-            stopAudioPlayback();
-
-            // Stop microphone
-            stopMicrophone();
-
-            // Close Gemini
-            closeGeminiSession();
-
-
-            setDoubtMode(
-                false
-            );
-
-            setStatus(
-                "Lecture resumed"
-            );
-
-
-            // --------------------------------
-            // Resume exact timestamp
-            // --------------------------------
-
-            if (
-                playerRef.current &&
-                pausedAt !== null
-            ) {
-
-                playerRef.current
-                    .seekTo(
-                        pausedAt,
-                        true
-                    );
-
-                playerRef.current
-                    .playVideo();
-
+                interactionIdRef.current = null;
+                return "";
+            } finally {
+                setLectureLoading(false);
             }
+        },
+        [videoUrl]
+    );
 
-        }, [
-            closeGeminiSession,
-            pausedAt,
-            stopAudioPlayback,
-            stopMicrophone,
-        ]);
+    // ---------------------------------------------------------
+    // ASK DOUBT
+    // ---------------------------------------------------------
 
-
-    // ========================================
-    // MANUAL FALLBACK
-    // ========================================
-
-    const manualFinish =
-        useCallback(() => {
-
-            if (
-                speechActiveRef.current
-            ) {
-
-                finishTurn();
-
+    const askDoubt = useCallback(async () => {
+        try {
+            if (!playerRef.current) {
+                setStatus("YouTube player is not ready.");
                 return;
-
             }
 
+            const currentTime = playerRef.current.getCurrentTime();
+            const exactTime = Math.floor(Number(currentTime) || 0);
 
-            if (
-                sessionRef.current
-            ) {
+            playerRef.current.pauseVideo();
 
-                setStatus(
-                    "Thinking..."
-                );
+            setPausedAt(exactTime);
+            setDoubtMode(true);
+            setConversation([]);
+            setStatus(`Paused at ${exactTime}s`);
 
+            const context = await analyzeLecture(exactTime);
 
-                try {
+            await createGeminiSession(context);
+            await startMicrophone();
 
-                    sessionRef.current
-                        .sendRealtimeInput({
-                            audioStreamEnd:
-                                true,
-                        });
+            setStatus("Gemini is listening.");
+        } catch (error) {
+            console.error("Ask doubt failed:", error);
+            setStatus("Could not start AI Tutor.");
+        }
+    }, [analyzeLecture, createGeminiSession, startMicrophone]);
 
-                } catch (error) {
+    // ---------------------------------------------------------
+    // CONTINUE LECTURE
+    // ---------------------------------------------------------
 
-                    console.error(
-                        error
-                    );
+    const continueLecture = useCallback(() => {
+        stopAudioPlayback();
+        stopVideoSharing();
+        stopMicrophone();
 
-                }
-
+        if (sessionRef.current) {
+            try {
+                sessionRef.current.close();
+            } catch {
+                // ignore
             }
+            sessionRef.current = null;
+        }
 
-        }, [finishTurn]);
+        interactionIdRef.current = null;
 
+        setDoubtMode(false);
+        setConversation([]);
 
-    // ========================================
-    // CLEANUP
-    // ========================================
+        if (playerRef.current) {
+            playerRef.current.seekTo(pausedAt, true);
+            playerRef.current.playVideo();
+        }
+
+        setStatus("Lecture resumed.");
+    }, [pausedAt, stopAudioPlayback, stopMicrophone, stopVideoSharing]);
+
+    // ---------------------------------------------------------
+    // CLEANUP WHEN PAGE CLOSES
+    // ---------------------------------------------------------
 
     useEffect(() => {
-
         return () => {
-
             stopAudioPlayback();
-
+            stopVideoSharing();
             stopMicrophone();
 
-            closeGeminiSession();
+            if (sessionRef.current) {
+                try {
+                    sessionRef.current.close();
+                } catch {
+                    // ignore
+                }
+                sessionRef.current = null;
+            }
 
+            if (outputAudioContextRef.current) {
+                outputAudioContextRef.current.close();
+                outputAudioContextRef.current = null;
+            }
         };
+    }, [stopAudioPlayback, stopMicrophone, stopVideoSharing]);
 
-    }, [
-        closeGeminiSession,
-        stopAudioPlayback,
-        stopMicrophone,
-    ]);
+    // ---------------------------------------------------------
+    // READ URL
+    // ---------------------------------------------------------
 
+    useEffect(() => {
+        const params = new URLSearchParams(window.location.search);
+        setVideoUrl(params.get("video") || "");
+    }, []);
 
-    // ========================================
-    // FORMAT TIME
-    // ========================================
+    const videoId = getYouTubeVideoId(videoUrl);
 
-    const formatTime =
-        (seconds: number) => {
-
-            const mins =
-                Math.floor(
-                    seconds / 60
-                );
-
-            const secs =
-                seconds % 60;
-
-            return `${mins}:${secs
-                .toString()
-                .padStart(2, "0")}`;
-
-        };
-
-
-    // ========================================
+    // ---------------------------------------------------------
     // UI
-    // ========================================
+    // ---------------------------------------------------------
 
     return (
+        <main style={{ minHeight: "100vh", background: "#000", color: "#fff", padding: "24px" }}>
+            <div style={{ maxWidth: "1500px", margin: "0 auto" }}>
+                <h1 style={{ fontSize: "32px", marginBottom: "8px" }}>AI Tutor</h1>
 
-        <main className="min-h-screen bg-black px-6 py-8 text-white">
-
-            <div className="mx-auto max-w-6xl">
-
-
-                {/* ==================================
-            HEADER
-        ================================== */}
-
-                <h1 className="mb-2 text-3xl font-bold">
-
-                    Ready to Learn
-
-                </h1>
-
-
-                <p className="mb-6 text-zinc-400">
-
+                <p style={{ color: "#aaa", marginBottom: "24px" }}>
                     Watch. Ask. Understand. Continue.
-
                 </p>
 
+                {!videoId && (
+                    <div
+                        style={{
+                            padding: "20px",
+                            border: "1px solid #333",
+                            borderRadius: "10px",
+                            color: "#aaa",
+                        }}
+                    >
+                        No valid YouTube video was provided.
+                    </div>
+                )}
 
-                <div className="grid gap-6 lg:grid-cols-[1.5fr_1fr]">
-
-
-                    {/* ==================================
-              VIDEO
-          ================================== */}
-
-                    <section>
-
-                        <div className="overflow-hidden rounded-2xl bg-zinc-900">
-
-                            {videoUrl ? (
-
+                {videoId && (
+                    <div
+                        style={{
+                            display: "grid",
+                            gridTemplateColumns: "minmax(0, 1.6fr) minmax(320px, 0.8fr)",
+                            gap: "24px",
+                            alignItems: "start",
+                        }}
+                    >
+                        <section>
+                            <div
+                                style={{
+                                    width: "100%",
+                                    borderRadius: "12px",
+                                    overflow: "hidden",
+                                    background: "#111",
+                                }}
+                            >
                                 <YouTube
-
-                                    videoId={
-                                        getYouTubeVideoId(
-                                            videoUrl
-                                        )
-                                    }
-
+                                    videoId={videoId}
                                     opts={{
-
-                                        width:
-                                            "100%",
-
-                                        height:
-                                            "500",
-
-                                        playerVars: {
-
-                                            autoplay:
-                                                0,
-
-                                            rel:
-                                                0,
-
-                                        },
-
+                                        width: "100%",
+                                        height: "500",
+                                        playerVars: { autoplay: 0, rel: 0 },
                                     }}
-
-
-                                    onReady={(
-                                        event
-                                    ) => {
-
-                                        playerRef.current =
-                                            event.target;
-
+                                    onReady={(event) => {
+                                        playerRef.current = event.target;
                                     }}
-
                                 />
-
-                            ) : (
-
-                                <div className="flex h-[500px] items-center justify-center text-zinc-500">
-
-                                    No video selected.
-
-                                </div>
-
-                            )}
-
-                        </div>
-
-
-                        {/* ==================================
-                MAIN BUTTON
-            ================================== */}
-
-                        {!doubtMode ? (
-
-                            <button
-
-                                onMouseDown={(
-                                    event
-                                ) =>
-                                    event.preventDefault()
-                                }
-
-                                onClick={
-                                    askDoubt
-                                }
-
-                                disabled={
-                                    lectureLoading ||
-                                    transcriptLoading
-                                }
-
-                                className="mt-4 w-full rounded-xl bg-white px-5 py-4 font-semibold text-black transition hover:bg-zinc-200 disabled:cursor-not-allowed disabled:opacity-50 select-none"
-
-                            >
-
-                                {transcriptLoading
-                                    ? "Loading Lecture..."
-                                    : lectureLoading
-                                        ? "Preparing Context..."
-                                        : "Ask a Doubt"}
-
-                            </button>
-
-                        ) : (
-
-                            <button
-
-                                onMouseDown={(
-                                    event
-                                ) =>
-                                    event.preventDefault()
-                                }
-
-                                onClick={
-                                    continueLecture
-                                }
-
-                                className="mt-4 w-full rounded-xl bg-white px-5 py-4 font-semibold text-black transition hover:bg-zinc-200 select-none"
-
-                            >
-
-                                Continue Lecture
-
-                            </button>
-
-                        )}
-
-                    </section>
-
-
-                    {/* ==================================
-              AI TUTOR
-          ================================== */}
-
-                    <section className="rounded-2xl border border-zinc-800 bg-zinc-950 p-5">
-
-
-                        {/* HEADER */}
-
-                        <div className="mb-4 flex items-center justify-between">
-
-                            <h2 className="text-xl font-semibold">
-
-                                AI Tutor
-
-                            </h2>
-
-
-                            <span className="text-sm text-zinc-400">
-
-                                {status}
-
-                            </span>
-
-                        </div>
-
-
-                        {/* ==================================
-                TIMESTAMP
-            ================================== */}
-
-                        {pausedAt !== null &&
-                            doubtMode && (
-
-                                <div className="mb-4 rounded-lg bg-zinc-900 px-4 py-3 text-sm text-zinc-300">
-
-                                    Lecture paused at{" "}
-
-                                    <strong>
-
-                                        {formatTime(
-                                            pausedAt
-                                        )}
-
-                                    </strong>
-
-                                </div>
-
-                            )}
-
-
-                        {/* ==================================
-                LECTURE CONTEXT
-            ================================== */}
-
-                        {doubtMode && (
-
-                            <div className="mb-4 rounded-lg border border-zinc-800 bg-zinc-900 px-4 py-3">
-
-                                <div className="flex items-center justify-between">
-
-                                    <span className="text-sm text-zinc-300">
-
-                                        Lecture context
-
-                                    </span>
-
-
-                                    <span className="text-xs text-zinc-500">
-
-                                        {lectureLoading
-                                            ? "Preparing..."
-                                            : lectureContext
-                                                ? "Connected"
-                                                : transcriptLoading
-                                                    ? "Loading..."
-                                                    : "Waiting"}
-
-                                    </span>
-
-                                </div>
-
-
-                                {!lectureContext && transcriptLoading && (
-
-                                    <p className="mt-2 text-xs text-zinc-500">
-
-                                        Loading the lecture transcript so the
-                                        tutor can use the relevant part instantly
-                                        when you ask a doubt.
-
-                                    </p>
-
-                                )}
-
-
-                                {lectureContext && (
-
-                                    <p className="mt-2 text-xs text-zinc-500">
-
-                                        Gemini is using the
-                                        lecture from 2 minutes
-                                        before your pause through
-                                        30 seconds after it, together
-                                        with its own knowledge.
-
-                                    </p>
-
-                                )}
-
                             </div>
 
-                        )}
-
-
-                        {/* ==================================
-                MICROPHONE
-            ================================== */}
-
-                        {doubtMode && (
-
-                            <div className="mb-4 rounded-lg bg-zinc-900 px-4 py-3 text-sm text-zinc-300">
-
-                                <div className="flex items-center justify-between">
-
-                                    <span>
-                                        Microphone
-                                    </span>
-
-
-                                    <span>
-
-                                        {speaking
-                                            ? "Speaking"
-                                            : "Waiting"}
-
-                                    </span>
-
+                            <div
+                                style={{
+                                    marginTop: "16px",
+                                    padding: "16px",
+                                    background: "#111",
+                                    border: "1px solid #292929",
+                                    borderRadius: "10px",
+                                }}
+                            >
+                                <div style={{ color: "#aaa", fontSize: "14px", marginBottom: "8px" }}>
+                                    Lecture
                                 </div>
+                                <div style={{ wordBreak: "break-all", fontSize: "14px" }}>
+                                    {videoUrl}
+                                </div>
+                            </div>
+                        </section>
 
+                        <section
+                            style={{
+                                background: "#0d0d0d",
+                                border: "1px solid #292929",
+                                borderRadius: "12px",
+                                padding: "20px",
+                                minHeight: "500px",
+                            }}
+                        >
+                            <h2 style={{ fontSize: "22px", marginBottom: "8px" }}>AI Tutor</h2>
 
-                                <div className="mt-2 h-2 overflow-hidden rounded-full bg-zinc-800">
+                            <div style={{ color: "#aaa", fontSize: "14px", marginBottom: "20px" }}>
+                                {status}
+                            </div>
+
+                            {!doubtMode && (
+                                <button
+                                    onClick={askDoubt}
+                                    disabled={lectureLoading}
+                                    style={{
+                                        width: "100%",
+                                        padding: "14px",
+                                        border: "none",
+                                        borderRadius: "8px",
+                                        background: "#fff",
+                                        color: "#000",
+                                        cursor: lectureLoading ? "not-allowed" : "pointer",
+                                        fontSize: "16px",
+                                        fontWeight: 600,
+                                        opacity: lectureLoading ? 0.6 : 1,
+                                    }}
+                                >
+                                    {lectureLoading ? "Analyzing..." : "Ask Doubt"}
+                                </button>
+                            )}
+
+                            {doubtMode && (
+                                <>
+                                    <div
+                                        style={{
+                                            padding: "14px",
+                                            border: "1px solid #333",
+                                            borderRadius: "8px",
+                                            marginBottom: "14px",
+                                        }}
+                                    >
+                                        <div style={{ fontSize: "13px", color: "#888", marginBottom: "6px" }}>
+                                            Paused at
+                                        </div>
+                                        <strong>{pausedAt}s</strong>
+                                    </div>
 
                                     <div
-
-                                        className="h-full rounded-full bg-white transition-all"
-
                                         style={{
-                                            width: `${Math.min(
-                                                100,
-                                                micLevel
-                                            )}%`,
+                                            padding: "14px",
+                                            border: "1px solid #333",
+                                            borderRadius: "8px",
+                                            marginBottom: "12px",
                                         }}
-
-                                    />
-
-                                </div>
-
-                            </div>
-
-                        )}
-
-
-                        {/* ==================================
-                CONVERSATION
-            ================================== */}
-
-                        <div className="min-h-[300px] space-y-3 overflow-y-auto">
-
-                            {conversation.length ===
-                                0 ? (
-
-                                <p className="text-sm text-zinc-500">
-
-                                    {doubtMode
-                                        ? "Start speaking. Ask anything about the lecture."
-                                        : "Pause the lecture and ask your doubt here."}
-
-                                </p>
-
-                            ) : (
-
-                                conversation.map(
-                                    (
-                                        message,
-                                        index
-                                    ) => (
-
-                                        <div
-
-                                            key={`${message.role}-${index}`}
-
-                                            className={`rounded-xl p-3 text-sm ${message.role ===
-                                                "user"
-                                                ? "ml-8 bg-zinc-800 text-white"
-                                                : "mr-8 bg-zinc-900 text-zinc-200"
-                                                }`}
-
-                                        >
-
-                                            <div className="mb-1 text-xs font-semibold uppercase text-zinc-500">
-
-                                                {message.role ===
-                                                    "user"
-                                                    ? "You"
-                                                    : "Gemini"}
-
-                                            </div>
-
-
-                                            {message.text}
-
+                                    >
+                                        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                                            <span>Microphone</span>
+                                            <span style={{ color: micLevel > 0.05 ? "#fff" : "#777" }}>
+                                                {micLevel > 0.05 ? "Listening" : "Ready"}
+                                            </span>
                                         </div>
 
-                                    )
-                                )
+                                        <div
+                                            style={{
+                                                height: "5px",
+                                                background: "#222",
+                                                borderRadius: "10px",
+                                                marginTop: "10px",
+                                                overflow: "hidden",
+                                            }}
+                                        >
+                                            <div
+                                                style={{
+                                                    width: `${Math.round(micLevel * 100)}%`,
+                                                    height: "100%",
+                                                    background: "#fff",
+                                                    transition: "width 80ms linear",
+                                                }}
+                                            />
+                                        </div>
+                                    </div>
 
+                                    <div
+                                        style={{
+                                            padding: "14px",
+                                            border: "1px solid #333",
+                                            borderRadius: "8px",
+                                            marginBottom: "12px",
+                                        }}
+                                    >
+                                        <div
+                                            style={{
+                                                display: "flex",
+                                                justifyContent: "space-between",
+                                                alignItems: "center",
+                                                marginBottom: "10px",
+                                            }}
+                                        >
+                                            <span>Lecture Vision</span>
+                                            <span style={{ fontSize: "13px", color: videoSharing ? "#fff" : "#777" }}>
+                                                {videoSharing ? "LIVE" : "OFF"}
+                                            </span>
+                                        </div>
+
+                                        <button
+                                            onClick={videoSharing ? stopVideoSharing : startVideoSharing}
+                                            style={{
+                                                width: "100%",
+                                                padding: "12px",
+                                                border: "1px solid #444",
+                                                borderRadius: "7px",
+                                                background: videoSharing ? "#222" : "#fff",
+                                                color: videoSharing ? "#fff" : "#000",
+                                                cursor: "pointer",
+                                                fontSize: "14px",
+                                                fontWeight: 600,
+                                            }}
+                                        >
+                                            {videoSharing ? "Stop Lecture Vision" : "Share Lecture With AI"}
+                                        </button>
+
+                                        <p style={{ fontSize: "12px", color: "#777", lineHeight: "1.5", marginTop: "10px", marginBottom: 0 }}>
+                                            Click this and choose <strong>This Tab</strong> in the browser sharing dialog. Gemini will receive approximately one lecture frame per second.
+                                        </p>
+                                    </div>
+
+                                    <div
+                                        style={{
+                                            padding: "12px",
+                                            border: "1px solid #333",
+                                            borderRadius: "8px",
+                                            marginBottom: "12px",
+                                            textAlign: "center",
+                                            color: speaking ? "#fff" : "#777",
+                                        }}
+                                    >
+                                        {speaking ? "Gemini is speaking..." : "Gemini is ready"}
+                                    </div>
+
+                                    <div style={{ maxHeight: "280px", overflowY: "auto", marginBottom: "16px" }}>
+                                        {conversation.length === 0 && (
+                                            <div style={{ padding: "20px", textAlign: "center", color: "#666", fontSize: "14px" }}>
+                                                Ask your doubt using your microphone.
+                                            </div>
+                                        )}
+
+                                        {conversation.map((item, index) => (
+                                            <div
+                                                key={index}
+                                                style={{
+                                                    marginBottom: "12px",
+                                                    padding: "12px",
+                                                    borderRadius: "8px",
+                                                    background: item.role === "user" ? "#151515" : "#111",
+                                                    border: "1px solid #252525",
+                                                }}
+                                            >
+                                                <div style={{ fontSize: "12px", color: "#777", marginBottom: "5px" }}>
+                                                    {item.role === "user" ? "You" : "AI Tutor"}
+                                                </div>
+                                                <div style={{ fontSize: "14px", lineHeight: "1.5" }}>{item.text}</div>
+                                            </div>
+                                        ))}
+                                    </div>
+
+                                    <button
+                                        onClick={continueLecture}
+                                        style={{
+                                            width: "100%",
+                                            padding: "13px",
+                                            border: "none",
+                                            borderRadius: "8px",
+                                            background: "#fff",
+                                            color: "#000",
+                                            cursor: "pointer",
+                                            fontSize: "15px",
+                                            fontWeight: 600,
+                                        }}
+                                    >
+                                        Continue Lecture
+                                    </button>
+                                </>
                             )}
-
-                        </div>
-
-
-                        {/* ==================================
-                MANUAL FALLBACK
-            ================================== */}
-
-                        {doubtMode && (
-
-                            <button
-
-                                onMouseDown={(
-                                    event
-                                ) =>
-                                    event.preventDefault()
-                                }
-
-                                onClick={
-                                    manualFinish
-                                }
-
-                                className="mt-4 w-full rounded-xl border border-zinc-700 px-4 py-3 text-sm font-medium text-zinc-200 hover:bg-zinc-900 select-none"
-
-                            >
-
-                                Finish & Ask Now
-
-                            </button>
-
-                        )}
-
-                    </section>
-
-                </div>
-
+                        </section>
+                    </div>
+                )}
             </div>
-
         </main>
-
     );
 }

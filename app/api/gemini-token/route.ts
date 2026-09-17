@@ -1,5 +1,9 @@
 import { GoogleGenAI } from "@google/genai";
 
+export const runtime = "nodejs";
+
+const LIVE_MODEL = "gemini-3.1-flash-live-preview";
+
 export async function GET() {
     try {
         const apiKey = process.env.GEMINI_API_KEY;
@@ -21,11 +25,11 @@ export async function GET() {
 
         const token = await client.authTokens.create({
             config: {
-                uses: 1,
+                uses: 3,
                 expireTime,
 
                 liveConnectConstraints: {
-                    model: "gemini-3.1-flash-live-preview",
+                    model: LIVE_MODEL,
 
                     config: {
                         responseModalities: ["AUDIO"],
@@ -37,6 +41,7 @@ export async function GET() {
 
         return Response.json({
             token: token.name,
+            model: LIVE_MODEL,
         });
     } catch (error) {
         console.error("Gemini token error:", error);

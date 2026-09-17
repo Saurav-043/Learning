@@ -3,19 +3,24 @@
 import { useState } from "react";
 import { useRouter } from "next/navigation";
 
-export default function Home() {
+export default function HomePage() {
   const [videoUrl, setVideoUrl] = useState("");
+  const [error, setError] = useState("");
+
   const router = useRouter();
 
-  function startLearning() {
-    if (!videoUrl.trim()) {
+  const handleStart = () => {
+    const trimmed = videoUrl.trim();
+
+    if (!trimmed) {
+      setError("Please paste a YouTube lecture URL.");
       return;
     }
 
-    router.push(
-      `/learn?video=${encodeURIComponent(videoUrl.trim())}`
-    );
-  }
+    setError("");
+
+    router.push(`/learn?video=${encodeURIComponent(trimmed)}`);
+  };
 
   return (
     <main
@@ -23,65 +28,67 @@ export default function Home() {
         minHeight: "100vh",
         background: "#000",
         color: "#fff",
-        padding: "60px 48px",
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        padding: "24px",
       }}
     >
-      <h1
-        style={{
-          fontSize: "48px",
-          marginBottom: "12px",
-        }}
-      >
-        Ready to Learn
-      </h1>
+      <div style={{ maxWidth: "560px", width: "100%" }}>
+        <h1 style={{ fontSize: "32px", marginBottom: "8px" }}>
+          AI Tutor
+        </h1>
 
-      <p
-        style={{
-          fontSize: "22px",
-          color: "#aaa",
-          marginBottom: "40px",
-        }}
-      >
-        Watch. Ask. Understand. Continue.
-      </p>
+        <p style={{ color: "#aaa", marginBottom: "24px" }}>
+          Paste a YouTube lecture link to start learning with an AI
+          tutor.
+        </p>
 
-      <div
-        style={{
-          maxWidth: "700px",
-        }}
-      >
         <input
           type="text"
           value={videoUrl}
-          onChange={(e) => setVideoUrl(e.target.value)}
-          onKeyDown={(e) => {
-            if (e.key === "Enter") {
-              startLearning();
+          onChange={(event) => setVideoUrl(event.target.value)}
+          onKeyDown={(event) => {
+            if (event.key === "Enter") {
+              handleStart();
             }
           }}
-          placeholder="Paste YouTube video URL"
+          placeholder="https://www.youtube.com/watch?v=..."
           style={{
             width: "100%",
-            padding: "16px",
-            fontSize: "18px",
+            padding: "14px",
+            borderRadius: "8px",
+            border: "1px solid #333",
             background: "#111",
             color: "#fff",
-            border: "1px solid #444",
-            borderRadius: "8px",
-            outline: "none",
-            marginBottom: "16px",
+            fontSize: "15px",
+            marginBottom: "12px",
           }}
         />
 
+        {error && (
+          <div
+            style={{
+              color: "#ff6b6b",
+              marginBottom: "12px",
+              fontSize: "14px",
+            }}
+          >
+            {error}
+          </div>
+        )}
+
         <button
-          onClick={startLearning}
+          onClick={handleStart}
           style={{
-            padding: "14px 24px",
-            fontSize: "18px",
-            background: "#fff",
-            color: "#000",
+            width: "100%",
+            padding: "14px",
             border: "none",
             borderRadius: "8px",
+            background: "#fff",
+            color: "#000",
+            fontSize: "16px",
+            fontWeight: 600,
             cursor: "pointer",
           }}
         >

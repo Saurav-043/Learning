@@ -1,232 +1,314 @@
+import { NextRequest, NextResponse } from "next/server";
 import { GoogleGenAI } from "@google/genai";
 
-type RequestBody = {
-    videoUrl: string;
-    timestamp: number;
+export const runtime = "nodejs";
+
+const MODEL = "gemini-3.8-flash";
+const CONTEXT_WINDOW_BEFORE_SECONDS = 90;
+const CONTEXT_WINDOW_AFTER_SECONDS = 30;
+const TIMESTAMP_BUCKET_SECONDS = 20;
+const MAX_RETRIES = 1;
+const INITIAL_RETRY_DELAY_MS = 1500;
+const CACHE_TTL_MS = 10 * 60 * 1000;
+
+type CacheEntry = {
+    context: string;
+    interactionId?: string;
+    createdAt: number;
 };
 
-function sleep(ms: number) {
+const cache = new Map<string, CacheEntry>();
+
+function formatTimestamp(totalSeconds: number): string {
+    const safeSeconds = Math.max(0, Math.floor(totalSeconds));
+    const minutes = Math.floor(safeSeconds / 60);
+    const seconds = safeSeconds % 60;
+    return `${String(minutes).padStart(2, "0")}:${String(seconds).padStart(
+        2,
+        "0"
+    )}`;
+}
+
+function extractYoutubeVideoId(url: string): string {
+    const value = url.trim();
+
+    if (/^[a-zA-Z0-9_-]{11}$/.test(value)) {
+        return value;
+    }
+
+    try {
+        const parsed = new URL(value);
+        const hostname = parsed.hostname.toLowerCase();
+
+        if (hostname === "youtu.be" || hostname.endsWith(".youtu.be")) {
+            return parsed.pathname.replace(/^\/+/, "").split("/")[0] || "";
+        }
+
+        if (
+            hostname === "youtube.com" ||
+            hostname === "www.youtube.com" ||
+            hostname.endsWith(".youtube.com")
+        ) {
+            const v = parsed.searchParams.get("v");
+            if (v) return v;
+
+            const parts = parsed.pathname.split("/").filter(Boolean);
+            const index = parts.findIndex((part) =>
+                ["embed", "shorts", "live"].includes(part.toLowerCase())
+            );
+
+            if (index !== -1 && parts[index + 1]) {
+                return parts[index + 1];
+            }
+        }
+    } catch {
+        return "";
+    }
+
+    return "";
+}
+
+function normalizeYoutubeUrl(url: string): string | null {
+    const id = extractYoutubeVideoId(url);
+    if (!id) return null;
+    return `https://www.youtube.com/watch?v=${id}`;
+}
+
+function sleep(ms: number): Promise<void> {
     return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-export async function POST(request: Request) {
+function extractStatusCode(error: unknown): number {
+    if (error && typeof error === "object") {
+        const anyError = error as Record<string, unknown>;
+        if (typeof anyError.status === "number") return anyError.status;
+        if (typeof anyError.code === "number") return anyError.code;
+        const message =
+            typeof anyError.message === "string" ? anyError.message : "";
+        const match = message.match(/"code"\s*:\s*(\d+)/);
+        if (match) return parseInt(match[1], 10);
+        const statusMatch = message.match(/\b(429|503|500|400|403|404)\b/);
+        if (statusMatch) return parseInt(statusMatch[1], 10);
+    }
+    return 500;
+}
+
+function extractErrorMessage(error: unknown): string {
+    if (error instanceof Error) return error.message;
+    if (typeof error === "string") return error;
+    return "Unknown error from Gemini API";
+}
+
+function bucketTimestamp(timestamp: number): number {
+    return (
+        Math.floor(timestamp / TIMESTAMP_BUCKET_SECONDS) *
+        TIMESTAMP_BUCKET_SECONDS
+    );
+}
+
+function extractInteractionText(interaction: any): string | undefined {
     try {
-        const body = (await request.json()) as RequestBody;
-
-        const { videoUrl, timestamp } = body;
-
-        if (!videoUrl || typeof videoUrl !== "string") {
-            return Response.json(
-                {
-                    success: false,
-                    error: "videoUrl is required",
-                },
-                { status: 400 }
-            );
+        const fromSteps = interaction?.steps?.at?.(-1)?.content?.[0]?.text;
+        if (typeof fromSteps === "string" && fromSteps.trim()) {
+            return fromSteps;
         }
+    } catch {
+        // fall through to other accessors
+    }
 
-        if (typeof timestamp !== "number" || timestamp < 0) {
-            return Response.json(
-                {
-                    success: false,
-                    error: "timestamp must be a valid number",
-                },
-                { status: 400 }
-            );
-        }
+    if (
+        typeof interaction?.outputText === "string" &&
+        interaction.outputText.trim()
+    ) {
+        return interaction.outputText;
+    }
 
-        const apiKey = process.env.GEMINI_API_KEY;
+    if (
+        typeof interaction?.output_text === "string" &&
+        interaction.output_text.trim()
+    ) {
+        return interaction.output_text;
+    }
 
-        if (!apiKey) {
-            return Response.json(
-                {
-                    success: false,
-                    error: "GEMINI_API_KEY is missing",
-                },
-                { status: 500 }
-            );
-        }
+    return undefined;
+}
 
-        const ai = new GoogleGenAI({
-            apiKey,
-        });
+export async function POST(request: NextRequest) {
+    let body: { videoUrl?: string; timestamp?: number };
 
-        const startTime = Math.max(0, timestamp - 120);
-        const endTime = timestamp + 30;
+    try {
+        body = await request.json();
+    } catch {
+        return NextResponse.json(
+            { success: false, error: "Request body must be valid JSON." },
+            { status: 400 }
+        );
+    }
 
-        const prompt = `
-You are preparing context for an AI tutor inside a video learning application.
+    const { videoUrl, timestamp } = body;
 
-The student paused the lecture at approximately ${timestamp} seconds.
+    if (!videoUrl || typeof videoUrl !== "string") {
+        return NextResponse.json(
+            { success: false, error: "A 'videoUrl' string is required." },
+            { status: 400 }
+        );
+    }
 
-Analyze the ACTUAL VIDEO around this point.
+    const normalizedUrl = normalizeYoutubeUrl(videoUrl);
 
-Relevant section:
-- Start: ${startTime} seconds
-- Pause: ${timestamp} seconds
-- End: ${endTime} seconds
+    if (!normalizedUrl) {
+        return NextResponse.json(
+            { success: false, error: "Could not parse a valid YouTube video from 'videoUrl'." },
+            { status: 400 }
+        );
+    }
 
-Use BOTH:
-
-1. What is spoken in the video.
-2. What is visually shown on screen.
-
-Pay special attention to:
-
-- code shown on screen
-- diagrams
-- formulas
-- graphs
-- tables
-- slides
-- highlighted text
-- UI demonstrations
-- examples
-- animations
-- anything the lecturer points to
-- relationships between spoken and visual information
-
-Do not summarize the entire video.
-
-Focus only on the section around the student's pause.
-
-Prepare useful context for another AI tutor.
-
-Include:
-
-- the main concept
-- definitions
-- important reasoning
-- formulas
-- examples
-- steps
-- code
-- diagrams
-- visual information
-- prerequisites
-- assumptions
-- likely misconceptions
-- important connections to the surrounding lecture
-
-The downstream AI tutor may freely use its own general knowledge to:
-
-- simplify difficult concepts
-- provide analogies
-- provide additional examples
-- explain prerequisites
-- correct misconceptions
-- fill gaps in the lecture
-- connect related concepts
-- explain things the lecturer skipped
-
-Do not address the student directly.
-
-Return only useful lecture context for the tutor.
-`;
-
-        let lastError: unknown = null;
-
-        for (let attempt = 0; attempt < 3; attempt++) {
-            try {
-                console.log(
-                    `Gemini video analysis attempt ${attempt + 1}`
-                );
-
-                const interaction = await ai.interactions.create({
-                    model: "gemini-3.8-flash",
-
-                    input: [
-                        {
-                            type: "text",
-                            text: prompt,
-                        },
-
-                        {
-                            type: "video",
-                            uri: videoUrl,
-                        },
-                    ],
-                });
-
-                const context =
-                    interaction.output_text || "";
-
-                if (!context.trim()) {
-                    throw new Error(
-                        "Gemini returned empty video context."
-                    );
-                }
-
-                console.log(
-                    "Gemini successfully understood video."
-                );
-
-                return Response.json({
-                    success: true,
-                    context,
-                    timestamp,
-                    startTime,
-                    endTime,
-                });
-            } catch (error) {
-                lastError = error;
-
-                const message =
-                    error instanceof Error
-                        ? error.message
-                        : String(error);
-
-                console.error(
-                    "Gemini video analysis error:",
-                    message
-                );
-
-                const temporary =
-                    message.includes("503") ||
-                    message.includes("UNAVAILABLE") ||
-                    message.includes("high demand") ||
-                    message.includes(
-                        "temporarily unavailable"
-                    );
-
-                if (!temporary) {
-                    break;
-                }
-
-                if (attempt < 2) {
-                    const delay =
-                        1500 * Math.pow(2, attempt);
-
-                    await sleep(delay);
-                }
-            }
-        }
-
-        return Response.json(
+    if (
+        timestamp === undefined ||
+        typeof timestamp !== "number" ||
+        !Number.isFinite(timestamp) ||
+        timestamp < 0
+    ) {
+        return NextResponse.json(
             {
                 success: false,
-                error:
-                    lastError instanceof Error
-                        ? lastError.message
-                        : String(lastError),
+                error: "A valid non-negative numeric 'timestamp' (in seconds) is required.",
             },
-            { status: 500 }
+            { status: 400 }
         );
-    } catch (error) {
-        console.error(
-            "Lecture context route error:",
-            error
-        );
+    }
 
-        return Response.json(
-            {
-                success: false,
-                error:
-                    error instanceof Error
-                        ? error.message
-                        : String(error),
-            },
+    const apiKey = process.env.GEMINI_API_KEY;
+    if (!apiKey) {
+        return NextResponse.json(
+            { success: false, error: "GEMINI_API_KEY is not configured on the server." },
             { status: 500 }
         );
     }
+
+    const timestampText = formatTimestamp(timestamp);
+    const bucketedTimestamp = bucketTimestamp(timestamp);
+    const windowStart = Math.max(
+        0,
+        bucketedTimestamp - CONTEXT_WINDOW_BEFORE_SECONDS
+    );
+    const windowEnd =
+        bucketedTimestamp + TIMESTAMP_BUCKET_SECONDS + CONTEXT_WINDOW_AFTER_SECONDS;
+
+    const cacheKey = `${normalizedUrl}::${bucketedTimestamp}`;
+    const cached = cache.get(cacheKey);
+    if (cached && Date.now() - cached.createdAt < CACHE_TTL_MS) {
+        return NextResponse.json({
+            success: true,
+            context: cached.context,
+            timestamp,
+            timestampText,
+            interactionId: cached.interactionId,
+            model: MODEL,
+            cached: true,
+        });
+    }
+
+    const ai = new GoogleGenAI({ apiKey });
+
+    const promptText = [
+        "This is an educational lecture video.",
+        `The student paused it at ${timestampText} (${timestamp} seconds in).`,
+        `Analyze the actual content of this lecture, focusing especially on what is happening between roughly ${formatTimestamp(windowStart)} and ${formatTimestamp(windowEnd)}, using the rest of the video as context if it helps make that part understandable.`,
+        "Identify the topic being taught.",
+        "Explain the concept(s) being covered.",
+        "Identify any definitions given.",
+        "Identify any equations or formulas shown or spoken, and write them out exactly.",
+        "Identify any code shown, and describe what it does.",
+        "Identify any diagrams shown, and describe their structure and labels.",
+        "Identify any examples given.",
+        "Explain what the lecturer is teaching at this point and what the student should understand by now.",
+        "Do not invent information that is not actually present in the video.",
+        "Return a clear, well-structured block of text suitable as background context for a separate AI tutor that has not seen the video.",
+    ].join(" ");
+
+    let lastError: unknown = null;
+
+    for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+        try {
+            const interaction: any = await ai.interactions.create({
+                model: MODEL,
+                input: [
+                    { type: "text", text: promptText },
+                    { type: "video", uri: normalizedUrl },
+                ],
+            } as any);
+
+            const context = extractInteractionText(interaction);
+
+            if (!context) {
+                return NextResponse.json(
+                    { success: false, error: "Gemini returned an empty response for this video." },
+                    { status: 502 }
+                );
+            }
+
+            cache.set(cacheKey, {
+                context,
+                interactionId: interaction.id,
+                createdAt: Date.now(),
+            });
+
+            return NextResponse.json({
+                success: true,
+                context,
+                timestamp,
+                timestampText,
+                interactionId: interaction.id,
+                model: MODEL,
+            });
+        } catch (error) {
+            lastError = error;
+            const statusCode = extractStatusCode(error);
+            const isRetryable = statusCode === 503;
+
+            if (isRetryable && attempt < MAX_RETRIES) {
+                await sleep(INITIAL_RETRY_DELAY_MS * Math.pow(2, attempt));
+                continue;
+            }
+
+            const message = extractErrorMessage(error);
+
+            if (statusCode === 429) {
+                return NextResponse.json(
+                    {
+                        success: false,
+                        error: "Gemini API quota exceeded (429 RESOURCE_EXHAUSTED). Check https://aistudio.google.com/usage — this is a project quota/billing issue, not a code bug.",
+                        details: message,
+                    },
+                    { status: 429 }
+                );
+            }
+
+            if (statusCode === 503) {
+                return NextResponse.json(
+                    {
+                        success: false,
+                        error: "Gemini API is temporarily unavailable (503 UNAVAILABLE). Please retry shortly.",
+                        details: message,
+                    },
+                    { status: 503 }
+                );
+            }
+
+            return NextResponse.json(
+                { success: false, error: "Gemini API request failed.", details: message },
+                { status: statusCode >= 400 && statusCode < 600 ? statusCode : 500 }
+            );
+        }
+    }
+
+    return NextResponse.json(
+        {
+            success: false,
+            error: "Gemini API request failed after retries.",
+            details: extractErrorMessage(lastError),
+        },
+        { status: 500 }
+    );
 }
