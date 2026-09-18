@@ -814,11 +814,10 @@ Answer naturally, like a patient teacher. Keep answers clear and reasonably conc
                 return;
             }
 
-            const currentTime = playerRef.current.getCurrentTime();
+            const currentTime = playerRef.current?.getCurrentTime() ?? 0;
             const exactTime = Math.floor(Number(currentTime) || 0);
 
-            playerRef.current.pauseVideo();
-
+            playerRef.current?.pauseVideo();
             setPausedAt(exactTime);
             setDoubtMode(true);
             setConversation([]);
@@ -831,8 +830,16 @@ Answer naturally, like a patient teacher. Keep answers clear and reasonably conc
 
             setStatus("Gemini is listening.");
         } catch (error) {
-            console.error("Ask doubt failed:", error);
-            setStatus("Could not start AI Tutor.");
+            console.error("❌ ASK DOUBT FAILED:", error);
+
+            const errorMessage =
+                error instanceof Error
+                    ? error.message
+                    : String(error);
+
+            setStatus(`Error: ${errorMessage}`);
+
+            alert(`AI Tutor Error:\n${errorMessage}`);
         }
     }, [analyzeLecture, createGeminiSession, startMicrophone]);
 
